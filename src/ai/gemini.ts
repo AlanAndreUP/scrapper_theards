@@ -11,15 +11,37 @@ interface GeminiContentPart {
 }
 
 interface GeminiGenerateResponse {
-  candidates?: {
-    content?: {
-      parts?: GeminiContentPart[];
-    };
-  }[];
+  candidates?: GeminiCandidate[];
   generatedImages?: {
     image?: {
       mimeType?: string;
       imageBytes?: string;
+    };
+  }[];
+}
+
+interface GeminiCandidate {
+  finishReason?: string;
+  content?: {
+    parts?: GeminiContentPart[];
+  };
+}
+
+interface ExtractedGeminiText {
+  text: string;
+  finishReason?: string;
+}
+
+interface CopyGenerationAttempt {
+  prompt: string;
+  maxOutputTokens: number;
+  temperature: number;
+}
+
+interface GeminiGenerateResponseLegacyCompat {
+  candidates?: {
+    content?: {
+      parts?: GeminiContentPart[];
     };
   }[];
 }
@@ -45,33 +67,53 @@ export class GeminiClient {
   }
 
   async generateViralCopy(captionOriginal: string, permalink: string): Promise<string> {
-    const prompt = [
+    const basePrompt = [
       'Eres un copywriter experto en futbol y memes para redes sociales.',
       'Genera un caption viral en español para Facebook (máx 280 caracteres).',
       'Reglas: tono picante pero no ofensivo, CTA corto, 3-5 hashtags relevantes, sin inventar resultados deportivos.',
+      'El copy debe ser texto completo y cerrar idea (no lo dejes truncado).',
       `Caption original: ${captionOriginal || '(sin caption)'}`,
       `Fuente: ${permalink}`,
       'Entrega solo el texto final del caption.'
     ].join('\n');
 
-    const response = await this.generateContent(this.config.textModel, {
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.9,
-        topP: 0.95,
-        maxOutputTokens: 220
-      }
+    const firstAttempt = await this.generateCopyAttempt({
+      prompt: basePrompt,
+      maxOutputTokens: 512,
+      temperature: 0.9
     });
 
-    const text = extractTextFromGemini(response);
+    let selected = firstAttempt;
+    if (isMaxTokensFinish(firstAttempt.finishReason)) {
+      this.logger.warn('Gemini copy came back with MAX_TOKENS, retrying with larger output budget', {
+        model: this.config.textModel,
+        firstLength: firstAttempt.text.length
+      });
+
+      const secondAttempt = await this.generateCopyAttempt({
+        prompt: `${basePrompt}\nNo cortes frases a la mitad. Termina con un cierre claro.`,
+        maxOutputTokens: 1024,
+        temperature: 0.8
+      });
+
+      if (
+        secondAttempt.text &&
+        (!isMaxTokensFinish(secondAttempt.finishReason) || secondAttempt.text.length >= firstAttempt.text.length)
+      ) {
+        selected = secondAttempt;
+      }
+    }
+
+    const text = normalizeGeneratedCopy(selected.text);
     if (!text) {
       throw new ExternalServiceError('Gemini no devolvió texto para el copy viral.');
     }
+
+    this.logger.info('Gemini copy generated', {
+      model: this.config.textModel,
+      length: text.length,
+      finishReason: selected.finishReason ?? 'unknown'
+    });
 
     return text;
   }
@@ -124,6 +166,24 @@ export class GeminiClient {
     return imageBuffer;
   }
 
+  private async generateCopyAttempt(attempt: CopyGenerationAttempt): Promise<ExtractedGeminiText> {
+    const response = await this.generateContent(this.config.textModel, {
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: attempt.prompt }]
+        }
+      ],
+      generationConfig: {
+        temperature: attempt.temperature,
+        topP: 0.95,
+        maxOutputTokens: attempt.maxOutputTokens
+      }
+    });
+
+    return extractTextFromGemini(response);
+  }
+
   private async generateContent(model: string, body: Record<string, unknown>): Promise<GeminiGenerateResponse> {
     try {
       const response = await this.http.post<GeminiGenerateResponse>(`/models/${model}:generateContent`, body, {
@@ -140,15 +200,44 @@ export class GeminiClient {
   }
 }
 
-function extractTextFromGemini(response: GeminiGenerateResponse): string {
-  const parts = response.candidates?.[0]?.content?.parts ?? [];
-  const text = parts
-    .map((part) => part.text?.trim())
+function extractTextFromGemini(response: GeminiGenerateResponse): ExtractedGeminiText {
+  const candidates = response.candidates ?? [];
+  let fallback: ExtractedGeminiText = { text: '' };
+
+  for (const candidate of candidates) {
+    const text = (candidate.content?.parts ?? [])
+      .map((part) => part.text?.trim())
+      .filter((value): value is string => Boolean(value))
+      .join('\n')
+      .trim();
+
+    if (!text) {
+      continue;
+    }
+
+    if (!isMaxTokensFinish(candidate.finishReason)) {
+      return toExtractedText(text, candidate.finishReason);
+    }
+
+    if (text.length > fallback.text.length) {
+      fallback = toExtractedText(text, candidate.finishReason);
+    }
+  }
+
+  if (fallback.text.length > 0) {
+    return fallback;
+  }
+
+  const legacy = response as GeminiGenerateResponseLegacyCompat;
+  const legacyText = legacy.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text?.trim())
     .filter((value): value is string => Boolean(value))
     .join('\n')
     .trim();
 
-  return text;
+  return {
+    text: legacyText ?? ''
+  };
 }
 
 function extractImageFromGemini(response: GeminiGenerateResponse): Buffer | null {
@@ -200,4 +289,25 @@ function normalizeAxiosError(error: unknown): string {
   }
 
   return String(error);
+}
+
+function normalizeGeneratedCopy(text: string): string {
+  const compact = text
+    .replace(/^```[a-zA-Z]*\s*/g, '')
+    .replace(/```$/g, '')
+    .replace(/\r/g, '')
+    .trim();
+
+  return compact.replace(/\n{3,}/g, '\n\n');
+}
+
+function isMaxTokensFinish(finishReason: string | undefined): boolean {
+  return (finishReason ?? '').toUpperCase() === 'MAX_TOKENS';
+}
+
+function toExtractedText(text: string, finishReason: string | undefined): ExtractedGeminiText {
+  if (finishReason) {
+    return { text, finishReason };
+  }
+  return { text };
 }

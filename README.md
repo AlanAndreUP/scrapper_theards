@@ -6,7 +6,7 @@ Pipeline listo para producción (sin login a Instagram) que:
 2. (Opcional) Usa Threads como fuente/fallback si Instagram bloquea.
 3. Detecta el post más reciente (imagen/carrusel/reel).
 4. Extrae caption + permalink + media URL(s).
-5. Deduplica por `permalink + hash(caption)`.
+5. Deduplica por `bucket folder key` (`ig/{perfil}/{shortcode}` o `threads/{perfil}/{shortcode}`).
 6. Descarga imagen principal.
 7. Sube imagen original a Cloudflare R2 (S3 compatible).
 8. Usa Gemini para generar copy viral + imagen viral.
@@ -42,7 +42,7 @@ npm install
 2. Instala navegador para Playwright (Chromium):
 
 ```bash
-npx playwright install chromium
+npm run playwright:install
 ```
 
 3. Crea `.env` desde ejemplo:
@@ -103,10 +103,61 @@ El sistema hace match IG <-> Threads por username (`somostitanes`, `memesfan10`)
 - `npm run dev`: corre watcher en modo desarrollo.
 - `npm run build`: compila a `dist/`.
 - `npm run start`: corre build de producción.
+- `npm run pm2:start`: compila y levanta el servicio con PM2 (`ecosystem.config.cjs`).
+- `npm run pm2:restart`: reinicia servicio en PM2.
+- `npm run pm2:reload`: recarga configuración de PM2 con `--update-env`.
+- `npm run pm2:status`: muestra estado de procesos PM2.
+- `npm run pm2:logs`: stream de logs del proceso PM2.
+- `npm run pm2:stop`: detiene el servicio en PM2.
+- `npm run pm2:delete`: elimina el servicio de PM2.
+- `npm run pm2:save`: persiste la lista de procesos PM2 para reinicio del servidor.
 - `npm run ig:login`: abre navegador para login manual de Instagram y guarda sesión Playwright.
 - `npm run ig:export-session`: exporta la sesión guardada en formato base64 (texto).
 - `npm run lint`: lint con ESLint.
 - `npm run test`: pruebas unitarias mínimas (`retry`, `state`).
+
+## PM2 en Ubuntu Server
+
+1. Instala PM2 global:
+
+```bash
+sudo npm i -g pm2
+```
+
+2. En el proyecto, instala deps, Chromium y build:
+
+```bash
+cd /home/ashed605/scrapper_theards
+npm ci
+npm run playwright:install:deps
+npm run build
+```
+
+3. Levanta el servicio:
+
+```bash
+npm run pm2:start
+```
+
+4. Configura arranque automático al reiniciar el servidor:
+
+```bash
+pm2 startup systemd -u "$USER" --hp "$HOME"
+```
+
+Ejecuta el comando `sudo ...` que te imprime PM2, y luego:
+
+```bash
+npm run pm2:save
+```
+
+Comandos útiles:
+
+```bash
+npm run pm2:status
+npm run pm2:logs
+npm run pm2:restart
+```
 
 ## Sesión IG En Cloud
 
@@ -202,10 +253,12 @@ El cliente intenta obtener imagen binaria desde respuestas de `generateContent`.
    - Revisa mensaje TODO en logs para endpoint/modalidad exacta.
 
 4. **Playwright falla en servidor**
-   - Ejecuta `npx playwright install chromium` en el host.
+   - Ejecuta `npm run playwright:install` en el host.
    - En Docker/CI, asegúrate de instalar Chromium en build y dependencias del sistema.
    - Si estás en cloud Linux sin sandbox de kernel, usa `PLAYWRIGHT_DISABLE_SANDBOX=true`.
-   - Si tu entorno requiere libs de sistema, instala dependencias de Playwright para Linux.
+   - Si aparece `error while loading shared libraries: libnspr4.so`, instala dependencias Linux:
+     - `npm run playwright:install:deps`
+     - o en Debian/Ubuntu: `sudo apt-get update && sudo apt-get install -y libnspr4 libnss3 libatk-bridge2.0-0 libgtk-3-0 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libasound2t64`
 
 ## Ejecución
 

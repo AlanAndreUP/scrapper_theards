@@ -55,7 +55,7 @@ export async function retry<T>(operation: () => Promise<T>, options: RetryOption
 
 function defaultShouldRetry(error: unknown): boolean {
   if (!error || typeof error !== 'object') {
-    return true;
+    return !isClearlyNonRetryableByMessage(error);
   }
 
   const record = error as Record<string, unknown>;
@@ -69,6 +69,10 @@ function defaultShouldRetry(error: unknown): boolean {
     if (nonRetryableCodes.includes(record.code)) {
       return false;
     }
+  }
+
+  if (isClearlyNonRetryableByMessage(error)) {
+    return false;
   }
 
   return true;
@@ -111,4 +115,13 @@ function extractErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function isClearlyNonRetryableByMessage(error: unknown): boolean {
+  const message = extractErrorMessage(error).toLowerCase();
+  return (
+    message.includes('error while loading shared libraries') ||
+    message.includes('cannot open shared object file') ||
+    message.includes('libnspr4.so')
+  );
 }

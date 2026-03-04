@@ -1,4 +1,4 @@
-import { chromium, type Page } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { ScraperExtractionError } from '../utils/errors';
 import type { Logger } from '../utils/logger';
 import type { InstagramPost, InstagramMediaType } from './instagramScraper';
@@ -23,17 +23,20 @@ export class ThreadsScraper {
 
   async getLatestPost(profileUrl: string): Promise<InstagramPost> {
     const launchArgs = this.disableSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
-    const browser = await chromium.launch({ headless: this.headless, args: launchArgs });
-    const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      locale: 'es-ES'
-    });
-
-    const page = await context.newPage();
-    page.setDefaultTimeout(this.requestTimeoutMs);
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
 
     try {
+      browser = await chromium.launch({ headless: this.headless, args: launchArgs });
+      context = await browser.newContext({
+        userAgent:
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        locale: 'es-ES'
+      });
+
+      const page = await context.newPage();
+      page.setDefaultTimeout(this.requestTimeoutMs);
+
       await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: this.requestTimeoutMs });
       await page.waitForLoadState('networkidle', { timeout: this.requestTimeoutMs }).catch(() => undefined);
 
@@ -94,10 +97,22 @@ export class ThreadsScraper {
         throw error;
       }
 
+      if (isMissingPlaywrightDependency(error)) {
+        throw markAsNonRetryable(
+          new ScraperExtractionError(
+            `Playwright Chromium no puede iniciar por librerías del sistema faltantes. Instala dependencias con: npx playwright install --with-deps chromium. Detalle: ${getErrorMessage(error)}`
+          )
+        );
+      }
+
       throw new ScraperExtractionError(`Error extrayendo Threads: ${getErrorMessage(error)}`, { cause: error });
     } finally {
-      await context.close();
-      await browser.close();
+      if (context) {
+        await context.close();
+      }
+      if (browser) {
+        await browser.close();
+      }
     }
   }
 }
@@ -174,4 +189,9 @@ function markAsNonRetryable<T extends Error>(error: T): T & { retryable: false }
   const enriched = error as T & { retryable: false };
   enriched.retryable = false;
   return enriched;
+}
+
+function isMissingPlaywrightDependency(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes('error while loading shared libraries') || message.includes('libnspr4.so');
 }

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { chromium, type APIRequestContext, type BrowserContextOptions, type Page } from 'playwright';
+import { chromium, type APIRequestContext, type Browser, type BrowserContext, type BrowserContextOptions, type Page } from 'playwright';
 import { ScraperExtractionError } from '../utils/errors';
 import type { Logger } from '../utils/logger';
 
@@ -92,7 +92,6 @@ export class InstagramScraper {
 
   async getLatestPost(profileUrl: string): Promise<InstagramPost> {
     const launchArgs = this.disableSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
-    const browser = await chromium.launch({ headless: this.headless, args: launchArgs });
     const contextOptions: BrowserContextOptions = {
       userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -109,21 +108,26 @@ export class InstagramScraper {
       }
     }
 
-    const context = await browser.newContext(contextOptions);
-    if (this.useAuthSession && this.storageStatePath && contextOptions.storageState) {
-      const loadedCookies = await context.cookies('https://www.instagram.com');
-      const hasSessionCookie = loadedCookies.some((cookie) => cookie.name === 'sessionid');
-      this.logger.info('Instagram scraper running with auth session', {
-        storageStatePath: this.storageStatePath,
-        cookiesLoaded: loadedCookies.length,
-        hasSessionCookie
-      });
-    }
-
-    const page = await context.newPage();
-    page.setDefaultTimeout(this.requestTimeoutMs);
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
 
     try {
+      browser = await chromium.launch({ headless: this.headless, args: launchArgs });
+      context = await browser.newContext(contextOptions);
+
+      if (this.useAuthSession && this.storageStatePath && contextOptions.storageState) {
+        const loadedCookies = await context.cookies('https://www.instagram.com');
+        const hasSessionCookie = loadedCookies.some((cookie) => cookie.name === 'sessionid');
+        this.logger.info('Instagram scraper running with auth session', {
+          storageStatePath: this.storageStatePath,
+          cookiesLoaded: loadedCookies.length,
+          hasSessionCookie
+        });
+      }
+
+      const page = await context.newPage();
+      page.setDefaultTimeout(this.requestTimeoutMs);
+
       // Fast path: with authenticated session, this endpoint is usually the most stable.
       if (this.useAuthSession) {
         const apiFirstResult = await this.getLatestPostViaWebProfileInfo(context.request, profileUrl);
@@ -317,12 +321,24 @@ export class InstagramScraper {
         throw error;
       }
 
+      if (isMissingPlaywrightDependency(error)) {
+        throw markAsNonRetryable(
+          new ScraperExtractionError(
+            `Playwright Chromium no puede iniciar por librerías del sistema faltantes. Instala dependencias con: npx playwright install --with-deps chromium. Detalle: ${getErrorMessage(error)}`
+          )
+        );
+      }
+
       throw new ScraperExtractionError(`Error al extraer el post más reciente de Instagram: ${getErrorMessage(error)}`, {
         cause: error
       });
     } finally {
-      await context.close();
-      await browser.close();
+      if (context) {
+        await context.close();
+      }
+      if (browser) {
+        await browser.close();
+      }
     }
   }
 
@@ -643,4 +659,9 @@ function markAsNonRetryable<T extends Error>(error: T): T & { retryable: false }
   const enriched = error as T & { retryable: false };
   enriched.retryable = false;
   return enriched;
+}
+
+function isMissingPlaywrightDependency(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes('error while loading shared libraries') || message.includes('libnspr4.so');
 }
