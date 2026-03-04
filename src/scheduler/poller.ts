@@ -151,6 +151,13 @@ export class Poller {
       );
 
       const viralPublicUrl = this.deps.r2.getPublicUrl(viralKey);
+      this.deps.logger.info('Prepared Facebook caption', {
+        permalink: latestPost.permalink,
+        shortcode: latestPost.shortcode,
+        copyLength: viralCopy.length,
+        copyPreview: viralCopy.slice(0, 140)
+      });
+
       const publishResult = await this.withRetry('facebook.publishPhotoToPage', () =>
         this.deps.facebook.publishPhotoToPage(
           this.config.facebookPageId,

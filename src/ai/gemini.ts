@@ -104,7 +104,38 @@ export class GeminiClient {
       }
     }
 
-    const text = normalizeGeneratedCopy(selected.text);
+    let text = normalizeGeneratedCopy(selected.text);
+    if (looksLikeTruncatedCopy(text)) {
+      this.logger.warn('Gemini copy seems truncated by heuristic; requesting rewrite', {
+        model: this.config.textModel,
+        length: text.length,
+        finishReason: selected.finishReason ?? 'unknown',
+        ending: text.slice(-24)
+      });
+
+      const repairPrompt = [
+        'Reescribe y completa este copy para Facebook sin dejar frases a la mitad.',
+        'Máximo 280 caracteres.',
+        'Tono futbol + memes, CTA corto, 3-5 hashtags.',
+        'Devuelve solo el copy final, completo y listo para publicar.',
+        `Borrador truncado o incompleto: ${text}`,
+        `Caption original: ${captionOriginal || '(sin caption)'}`,
+        `Fuente: ${permalink}`
+      ].join('\n');
+
+      const repaired = await this.generateCopyAttempt({
+        prompt: repairPrompt,
+        maxOutputTokens: 1024,
+        temperature: 0.7
+      });
+
+      if (repaired.text) {
+        text = normalizeGeneratedCopy(repaired.text);
+        selected = repaired;
+      }
+    }
+
+    text = fitMaxLengthWithoutBreakingWords(text, 280);
     if (!text) {
       throw new ExternalServiceError('Gemini no devolvió texto para el copy viral.');
     }
@@ -122,10 +153,14 @@ export class GeminiClient {
     const inputMimeType = detectImageMimeType(inputImageBuffer);
 
     const prompt = [
-      'Edita/genera una imagen viral en estilo futbol-meme para Facebook.',
-      'Debe conservar la esencia del sujeto original, aumentar impacto visual, contraste alto, texto meme corto en español.',
+      'Edita/genera una imagen para Facebook con estilo NOTICIA DEPORTIVA (editorial), no meme.',
+      'Debe conservar la esencia del sujeto original con enfoque fotorealista y periodístico.',
+      'Look & feel: cobertura deportiva profesional, composición limpia, color grading natural, nitidez alta.',
+      'Prohibido: estilo meme, stickers, globos de diálogo, tipografía caricaturesca, chistes visuales, emojis grandes.',
+      'No deformes rostros ni cuerpos; evita estética de caricatura o collage.',
+      'Si incluyes texto, que sea solo un titular breve estilo noticiero deportivo, sobrio y legible.',
       'Si la imagen original contiene el logo, marca de agua o texto de "Somos Titanes", elimínalo completamente del resultado final.',
-      'Evita marcas registradas y rostros deformados.',
+      'Evita marcas registradas, escudos alterados y elementos inventados.',
       `Contexto del caption original: ${captionOriginal || '(sin caption)'}`,
       'Devuelve la mejor imagen final en formato JPG o PNG.'
     ].join('\n');
@@ -147,7 +182,7 @@ export class GeminiClient {
       ],
       generationConfig: {
         responseModalities: ['IMAGE', 'TEXT'],
-        temperature: 0.8
+        temperature: 0.45
       }
     });
 
@@ -310,4 +345,75 @@ function toExtractedText(text: string, finishReason: string | undefined): Extrac
     return { text, finishReason };
   }
   return { text };
+}
+
+function fitMaxLengthWithoutBreakingWords(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  const hardCut = text.slice(0, maxLength).trimEnd();
+  const lastSpace = hardCut.lastIndexOf(' ');
+  if (lastSpace < 40) {
+    return hardCut;
+  }
+
+  return hardCut.slice(0, lastSpace).trimEnd();
+}
+
+function looksLikeTruncatedCopy(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) {
+    return true;
+  }
+
+  if (normalized.length < 25) {
+    return true;
+  }
+
+  const lower = normalized.toLowerCase();
+  const danglingEndings = new Set([
+    'y',
+    'o',
+    'si',
+    'que',
+    'de',
+    'del',
+    'la',
+    'el',
+    'los',
+    'las',
+    'un',
+    'una',
+    'para',
+    'con',
+    'por',
+    'en',
+    'al',
+    'a',
+    'ya',
+    'pero'
+  ]);
+
+  const lastWord = lower.split(/\s+/).filter(Boolean).at(-1) ?? '';
+  if (danglingEndings.has(lastWord)) {
+    return true;
+  }
+
+  const unbalancedQuotes = (normalized.match(/"/g)?.length ?? 0) % 2 !== 0;
+  const unbalancedParens = countChar(normalized, '(') !== countChar(normalized, ')');
+  if (unbalancedQuotes || unbalancedParens) {
+    return true;
+  }
+
+  const endsWithStrongPunctuation = /[.!?…)]$/.test(normalized);
+  const endsWithHashtag = /#[\p{L}\p{N}_]+$/u.test(normalized);
+  const endsWithMention = /@[\p{L}\p{N}_.]+$/u.test(normalized);
+  const endsWithEmoji = /\p{Extended_Pictographic}$/u.test(normalized);
+
+  return !(endsWithStrongPunctuation || endsWithHashtag || endsWithMention || endsWithEmoji);
+}
+
+function countChar(text: string, char: string): number {
+  return Array.from(text).filter((current) => current === char).length;
 }
