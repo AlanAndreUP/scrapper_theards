@@ -36,6 +36,7 @@ const envSchema = z.object({
   IG_USE_AUTH_SESSION: booleanFromEnv.default(false),
   PLAYWRIGHT_STORAGE_STATE_PATH: z.string().default('./data/instagram-storage-state.json'),
   PLAYWRIGHT_STORAGE_STATE_B64: z.string().optional(),
+  PLAYWRIGHT_DISABLE_SANDBOX: booleanFromEnv.default(true),
 
   POLL_MINUTES: z.coerce
     .number()

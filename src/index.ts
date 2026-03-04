@@ -41,10 +41,11 @@ async function bootstrap(): Promise<void> {
 
   const scraper = new InstagramScraper(logger, env.REQUEST_TIMEOUT_MS, env.PLAYWRIGHT_HEADLESS, {
     useAuthSession: env.IG_USE_AUTH_SESSION,
-    storageStatePath: env.PLAYWRIGHT_STORAGE_STATE_PATH
+    storageStatePath: env.PLAYWRIGHT_STORAGE_STATE_PATH,
+    disableSandbox: env.PLAYWRIGHT_DISABLE_SANDBOX
   });
   const threadsScraper = env.WATCH_TARGETS.some((target) => Boolean(target.threadsUrl))
-    ? new ThreadsScraper(logger, env.REQUEST_TIMEOUT_MS, env.PLAYWRIGHT_HEADLESS)
+    ? new ThreadsScraper(logger, env.REQUEST_TIMEOUT_MS, env.PLAYWRIGHT_HEADLESS, env.PLAYWRIGHT_DISABLE_SANDBOX)
     : undefined;
 
   const r2 = new R2Storage(

@@ -11,6 +11,10 @@ const LEVEL_PRIORITY: Record<LogLevel, number> = {
 };
 
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|authorization|api[_-]?key|access[_-]?key)/i;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+const FB_TOKEN_PATTERN = /\bEA[A-Za-z0-9_-]{20,}\b/g;
+const GOOGLE_API_KEY_PATTERN = /\bAIza[0-9A-Za-z-_]{20,}\b/g;
+const URL_TOKEN_PARAM_PATTERN = /([?&](?:access_token|token|api_key|apikey|key)=)[^&\s]+/gi;
 
 export interface LoggerOptions {
   level?: LogLevel;
@@ -94,10 +98,16 @@ function sanitize(value: unknown): unknown {
   }
 
   if (typeof value === 'string') {
-    if (value.length > 120 && /[A-Za-z0-9_-]{30,}/.test(value)) {
-      return '[REDACTED]';
-    }
+    return redactSensitiveSubstrings(value);
   }
 
   return value;
+}
+
+function redactSensitiveSubstrings(value: string): string {
+  return value
+    .replace(JWT_PATTERN, '[REDACTED_JWT]')
+    .replace(FB_TOKEN_PATTERN, '[REDACTED_FB_TOKEN]')
+    .replace(GOOGLE_API_KEY_PATTERN, '[REDACTED_GOOGLE_API_KEY]')
+    .replace(URL_TOKEN_PARAM_PATTERN, '$1[REDACTED]');
 }

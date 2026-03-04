@@ -17,11 +17,13 @@ export class ThreadsScraper {
   constructor(
     private readonly logger: Logger,
     private readonly requestTimeoutMs: number,
-    private readonly headless: boolean
+    private readonly headless: boolean,
+    private readonly disableSandbox = true
   ) {}
 
   async getLatestPost(profileUrl: string): Promise<InstagramPost> {
-    const browser = await chromium.launch({ headless: this.headless });
+    const launchArgs = this.disableSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
+    const browser = await chromium.launch({ headless: this.headless, args: launchArgs });
     const context = await browser.newContext({
       userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',

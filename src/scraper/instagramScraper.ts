@@ -73,6 +73,7 @@ const POST_LINK_SELECTOR = 'article a[href*="/p/"], article a[href*="/reel/"], m
 export class InstagramScraper {
   private readonly useAuthSession: boolean;
   private readonly storageStatePath: string | undefined;
+  private readonly disableSandbox: boolean;
 
   constructor(
     private readonly logger: Logger,
@@ -81,14 +82,17 @@ export class InstagramScraper {
     options?: {
       useAuthSession?: boolean;
       storageStatePath?: string;
+      disableSandbox?: boolean;
     }
   ) {
     this.useAuthSession = options?.useAuthSession ?? false;
     this.storageStatePath = options?.storageStatePath;
+    this.disableSandbox = options?.disableSandbox ?? true;
   }
 
   async getLatestPost(profileUrl: string): Promise<InstagramPost> {
-    const browser = await chromium.launch({ headless: this.headless });
+    const launchArgs = this.disableSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
+    const browser = await chromium.launch({ headless: this.headless, args: launchArgs });
     const contextOptions: BrowserContextOptions = {
       userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',

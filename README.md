@@ -86,6 +86,7 @@ Opcionales:
 - `IG_USE_AUTH_SESSION` (default `false`)
 - `PLAYWRIGHT_STORAGE_STATE_PATH` (default `./data/instagram-storage-state.json`)
 - `PLAYWRIGHT_STORAGE_STATE_B64` (opcional, útil para cloud)
+- `PLAYWRIGHT_DISABLE_SANDBOX` (default `true`, recomendado en cloud Linux)
 
 Ejemplo multi-cuenta:
 
@@ -122,6 +123,7 @@ Para reducir login wall en servidores sin navegador interactivo:
 3. En tu plataforma cloud, crea secreto/env:
    - `IG_USE_AUTH_SESSION=true`
    - `PLAYWRIGHT_STORAGE_STATE_B64=<texto-base64-exportado>`
+   - `PLAYWRIGHT_DISABLE_SANDBOX=true`
 4. El servicio reconstruye automáticamente el archivo en `PLAYWRIGHT_STORAGE_STATE_PATH` al iniciar.
 
 ## Estructura
@@ -201,6 +203,8 @@ El cliente intenta obtener imagen binaria desde respuestas de `generateContent`.
 
 4. **Playwright falla en servidor**
    - Ejecuta `npx playwright install chromium` en el host.
+   - En Docker/CI, asegúrate de instalar Chromium en build y dependencias del sistema.
+   - Si estás en cloud Linux sin sandbox de kernel, usa `PLAYWRIGHT_DISABLE_SANDBOX=true`.
    - Si tu entorno requiere libs de sistema, instala dependencias de Playwright para Linux.
 
 ## Ejecución
