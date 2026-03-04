@@ -21,22 +21,22 @@ describe('StateStore', () => {
     }
   });
 
-  it('marks and validates processed items by permalink + caption hash', async () => {
+  it('marks and validates processed items by bucket folder key', async () => {
     const permalink = 'https://www.instagram.com/p/ABC123/';
-    const captionHash = 'hash-1';
+    const dedupeKey = 'ig/somostitanes/ABC123';
 
-    expect(await store.isProcessed(permalink, captionHash)).toBe(false);
+    expect(store.isProcessed(dedupeKey)).toBe(false);
 
     await store.markProcessed({
+      bucketFolderKey: dedupeKey,
       permalink,
-      captionHash,
       shortcode: 'ABC123',
       processedAt: new Date().toISOString(),
       facebookPostId: '1234567890'
     });
 
-    expect(await store.isProcessed(permalink, captionHash)).toBe(true);
-    expect(await store.isProcessed(permalink, 'hash-2')).toBe(false);
+    expect(store.isProcessed(dedupeKey)).toBe(true);
+    expect(store.isProcessed('ig/memesfan10/ABC123')).toBe(false);
   });
 
   it('stores run logs persistently', async () => {

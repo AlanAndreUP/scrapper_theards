@@ -6,14 +6,16 @@ import type { FacebookPublisher } from '../publisher/facebook';
 import type { InstagramScraper, InstagramPost } from '../scraper/instagramScraper';
 import type { ThreadsScraper } from '../scraper/threadsScraper';
 import type { R2Storage } from '../storage/r2';
-import { sha256 } from '../utils/hash';
 import type { Logger } from '../utils/logger';
 import { retry } from '../utils/retry';
 
+export interface PollerTarget {
+  instagramUrl: string;
+  threadsUrl?: string;
+}
+
 export interface PollerConfig {
-  profileUrl: string;
-  threadsProfileUrl?: string;
-  enableThreadsFallback: boolean;
+  targets: PollerTarget[];
   pollMinutes: number;
   requestTimeoutMs: number;
   maxRetries: number;
@@ -40,6 +42,13 @@ interface SourcedPost extends InstagramPost {
   sourceProfileUrl: string;
 }
 
+interface SelectedPost {
+  post: SourcedPost;
+  bucketFolderKey: string;
+  sourceFolder: 'ig' | 'threads';
+  profileSlug: string;
+}
+
 interface DownloadedMedia {
   buffer: Buffer;
   contentType: string;
@@ -52,7 +61,15 @@ export class Poller {
   constructor(private readonly config: PollerConfig, private readonly deps: PollerDependencies) {}
 
   start(): void {
-    const expression = `*/${this.config.pollMinutes} * * * *`;
+    const enforcedMinutes = 30;
+    if (this.config.pollMinutes !== enforcedMinutes) {
+      this.deps.logger.warn('POLL_MINUTES is overridden by business rule to 30 minutes', {
+        requestedPollMinutes: this.config.pollMinutes,
+        enforcedPollMinutes: enforcedMinutes
+      });
+    }
+
+    const expression = '*/30 * * * *';
 
     this.task = cron.schedule(expression, () => {
       void this.runTick();
@@ -60,7 +77,7 @@ export class Poller {
 
     this.deps.logger.info('Poller started', {
       cron: expression,
-      profileUrl: this.config.profileUrl
+      targets: this.config.targets
     });
 
     void this.runTick();
@@ -84,27 +101,15 @@ export class Poller {
 
     this.isRunning = true;
     const startedAt = Date.now();
-    let permalinkForLog: string | undefined;
-    let shortcodeForLog: string | undefined;
-    let sourceForLog: SourceKind | undefined;
+
+    let selectedForLog: SelectedPost | null = null;
 
     try {
-      const latestPost = await this.getLatestPostWithFallback();
-
-      permalinkForLog = latestPost.permalink;
-      shortcodeForLog = latestPost.shortcode;
-      sourceForLog = latestPost.source;
-
-      const captionHash = sha256(latestPost.caption);
-      const alreadyProcessed = this.deps.stateStore.isProcessed(latestPost.permalink, captionHash);
-
-      if (alreadyProcessed) {
+      const selected = await this.selectNextNewPost();
+      if (!selected) {
         const durationMs = Date.now() - startedAt;
-        this.deps.logger.info('Post unchanged. Nothing to do.', {
-          permalink: latestPost.permalink,
-          shortcode: latestPost.shortcode,
-          source: latestPost.source,
-          captionHash,
+        this.deps.logger.info('No new posts detected in configured targets. Cycle skipped.', {
+          targets: this.config.targets,
           durationMs
         });
 
@@ -112,23 +117,22 @@ export class Poller {
           runAt: new Date().toISOString(),
           durationMs,
           status: 'skipped',
-          permalink: latestPost.permalink,
-          shortcode: latestPost.shortcode,
-          detail: `Deduplicated (${latestPost.source} same permalink + caption hash).`
+          detail: 'No new posts in configured targets.'
         });
 
         return;
       }
+
+      selectedForLog = selected;
+      const latestPost = selected.post;
 
       const primaryMediaUrl = selectPrimaryMediaUrl(latestPost);
       const downloaded = await this.withRetry('media.download', () =>
         downloadMedia(primaryMediaUrl, this.config.requestTimeoutMs)
       );
 
-      const profileSlug = extractProfileSlug(latestPost.sourceProfileUrl);
-      const sourceFolder = latestPost.source === 'threads' ? 'threads' : 'ig';
-      const originalKey = `${sourceFolder}/${profileSlug}/${latestPost.shortcode}/original.jpg`;
-      const viralKey = `${sourceFolder}/${profileSlug}/${latestPost.shortcode}/viral.jpg`;
+      const originalKey = `${selected.sourceFolder}/${selected.profileSlug}/${latestPost.shortcode}/original.jpg`;
+      const viralKey = `${selected.sourceFolder}/${selected.profileSlug}/${latestPost.shortcode}/viral.jpg`;
 
       await this.withRetry('r2.upload.original', () =>
         this.deps.r2.uploadBuffer(originalKey, downloaded.buffer, downloaded.contentType)
@@ -158,8 +162,8 @@ export class Poller {
 
       const durationMs = Date.now() - startedAt;
       await this.deps.stateStore.markProcessed({
+        bucketFolderKey: selected.bucketFolderKey,
         permalink: latestPost.permalink,
-        captionHash,
         shortcode: latestPost.shortcode,
         facebookPostId: publishResult.post_id ?? publishResult.id,
         processedAt: new Date().toISOString()
@@ -172,15 +176,16 @@ export class Poller {
         permalink: latestPost.permalink,
         shortcode: latestPost.shortcode,
         facebookPostId: publishResult.post_id ?? publishResult.id,
-        detail: `Published to Facebook Page (source=${latestPost.source}).`
+        detail: `Published to Facebook Page (source=${latestPost.source}, dedupeKey=${selected.bucketFolderKey}).`
       });
 
       this.deps.logger.info('Pipeline success', {
         permalink: latestPost.permalink,
         shortcode: latestPost.shortcode,
         source: latestPost.source,
+        dedupeKey: selected.bucketFolderKey,
         mediaType: latestPost.mediaType,
-        publishPhotoId: publishResult.id,
+        publishPhotoId: publishResult.photo_id,
         publishPostId: publishResult.post_id,
         durationMs
       });
@@ -190,9 +195,10 @@ export class Poller {
 
       this.deps.logger.error('Pipeline failed', {
         error: message,
-        permalink: permalinkForLog,
-        shortcode: shortcodeForLog,
-        source: sourceForLog,
+        source: selectedForLog?.post.source,
+        permalink: selectedForLog?.post.permalink,
+        shortcode: selectedForLog?.post.shortcode,
+        dedupeKey: selectedForLog?.bucketFolderKey,
         durationMs
       });
 
@@ -200,21 +206,73 @@ export class Poller {
         runAt: new Date().toISOString(),
         durationMs,
         status: 'error',
-        detail: sourceForLog ? `[${sourceForLog}] ${message}` : message,
-        ...(permalinkForLog ? { permalink: permalinkForLog } : {}),
-        ...(shortcodeForLog ? { shortcode: shortcodeForLog } : {})
+        detail: message,
+        ...(selectedForLog?.post.permalink ? { permalink: selectedForLog.post.permalink } : {}),
+        ...(selectedForLog?.post.shortcode ? { shortcode: selectedForLog.post.shortcode } : {})
       });
     } finally {
       this.isRunning = false;
     }
   }
 
-  private async withRetry<T>(operationName: string, operation: () => Promise<T>): Promise<T> {
+  private async selectNextNewPost(): Promise<SelectedPost | null> {
+    for (const target of this.config.targets) {
+      const targetLabel = extractProfileSlug(target.instagramUrl);
+
+      try {
+        const latestPost = await this.getLatestPostWithFallback(target);
+        const profileSlug = extractProfileSlug(latestPost.sourceProfileUrl);
+        const sourceFolder: 'ig' | 'threads' = latestPost.source === 'threads' ? 'threads' : 'ig';
+        const bucketFolderKey = `${sourceFolder}/${profileSlug}/${latestPost.shortcode}`;
+
+        const alreadyProcessed = this.deps.stateStore.isProcessed(bucketFolderKey);
+        if (alreadyProcessed) {
+          this.deps.logger.info('Target checked with no new post', {
+            target: targetLabel,
+            source: latestPost.source,
+            dedupeKey: bucketFolderKey,
+            permalink: latestPost.permalink
+          });
+          continue;
+        }
+
+        this.deps.logger.info('Selected new post from priority list', {
+          target: targetLabel,
+          source: latestPost.source,
+          dedupeKey: bucketFolderKey,
+          permalink: latestPost.permalink
+        });
+
+        return {
+          post: latestPost,
+          bucketFolderKey,
+          sourceFolder,
+          profileSlug
+        };
+      } catch (error) {
+        this.deps.logger.warn('Target check failed. Continuing to next target.', {
+          target: targetLabel,
+          error: getErrorMessage(error)
+        });
+      }
+    }
+
+    return null;
+  }
+
+  private async withRetry<T>(
+    operationName: string,
+    operation: () => Promise<T>,
+    overrides?: {
+      retries?: number;
+      timeoutMs?: number;
+    }
+  ): Promise<T> {
     return retry(operation, {
-      retries: this.config.maxRetries,
+      retries: overrides?.retries ?? this.config.maxRetries,
       baseDelayMs: this.config.retryBaseDelayMs,
       maxDelayMs: this.config.retryMaxDelayMs,
-      timeoutMs: this.config.requestTimeoutMs,
+      timeoutMs: overrides?.timeoutMs ?? this.config.requestTimeoutMs,
       operationName,
       onRetry: ({ attempt, remainingRetries, delayMs, error }) => {
         this.deps.logger.warn('Retry scheduled', {
@@ -228,33 +286,39 @@ export class Poller {
     });
   }
 
-  private async getLatestPostWithFallback(): Promise<SourcedPost> {
+  private async getLatestPostWithFallback(target: PollerTarget): Promise<SourcedPost> {
+    const sourceRetries = Math.min(1, this.config.maxRetries);
+
     try {
-      const instagramPost = await this.withRetry('instagram.getLatestPost', () =>
-        this.deps.scraper.getLatestPost(this.config.profileUrl)
+      const instagramPost = await this.withRetry(
+        'instagram.getLatestPost',
+        () => this.deps.scraper.getLatestPost(target.instagramUrl),
+        { retries: sourceRetries }
       );
 
       return {
         ...instagramPost,
         source: 'instagram',
-        sourceProfileUrl: this.config.profileUrl
+        sourceProfileUrl: target.instagramUrl
       };
     } catch (instagramError) {
-      const threadsProfileUrl = this.config.threadsProfileUrl;
+      const threadsProfileUrl = target.threadsUrl;
       const threadsScraper = this.deps.threadsScraper;
-      const canUseThreadsFallback = this.config.enableThreadsFallback && Boolean(threadsProfileUrl) && Boolean(threadsScraper);
 
-      if (!canUseThreadsFallback || !threadsProfileUrl || !threadsScraper) {
+      if (!threadsProfileUrl || !threadsScraper) {
         throw instagramError;
       }
 
       this.deps.logger.warn('Instagram source failed; trying Threads fallback', {
-        error: getErrorMessage(instagramError),
-        threadsProfileUrl
+        instagramUrl: target.instagramUrl,
+        threadsProfileUrl,
+        error: getErrorMessage(instagramError)
       });
 
-      const threadsPost = await this.withRetry('threads.getLatestPost', () =>
-        threadsScraper.getLatestPost(threadsProfileUrl)
+      const threadsPost = await this.withRetry(
+        'threads.getLatestPost',
+        () => threadsScraper.getLatestPost(threadsProfileUrl),
+        { retries: sourceRetries }
       );
 
       return {
@@ -330,7 +394,8 @@ function detectImageMimeFromBuffer(buffer: Buffer): string {
 function extractProfileSlug(profileUrl: string): string {
   const url = new URL(profileUrl);
   const segments = url.pathname.split('/').filter(Boolean);
-  return segments[0] ?? 'profile';
+  const raw = segments[0] ?? 'profile';
+  return raw.replace(/^@/, '').toLowerCase();
 }
 
 function getErrorMessage(error: unknown): string {

@@ -8,6 +8,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "ig:login": "tsx src/scripts/instagramLogin.ts",
+    "ig:export-session": "tsx src/scripts/exportInstagramSession.ts",
     "lint": "eslint .",
     "test": "vitest run"
   },

@@ -1,4 +1,5 @@
-import { chromium, type APIRequestContext, type Page } from 'playwright';
+import { existsSync } from 'node:fs';
+import { chromium, type APIRequestContext, type BrowserContextOptions, type Page } from 'playwright';
 import { ScraperExtractionError } from '../utils/errors';
 import type { Logger } from '../utils/logger';
 
@@ -38,6 +39,11 @@ interface WebProfileInfoResponse {
   status?: string;
 }
 
+interface WebProfileFallbackResult {
+  post: InstagramPost | null;
+  statusCode?: number;
+}
+
 interface WebProfileMediaNode {
   shortcode?: string;
   is_video?: boolean;
@@ -65,24 +71,66 @@ interface WebProfileMediaNode {
 const POST_LINK_SELECTOR = 'article a[href*="/p/"], article a[href*="/reel/"], main a[href*="/p/"], main a[href*="/reel/"]';
 
 export class InstagramScraper {
+  private readonly useAuthSession: boolean;
+  private readonly storageStatePath: string | undefined;
+
   constructor(
     private readonly logger: Logger,
     private readonly requestTimeoutMs: number,
-    private readonly headless: boolean
-  ) {}
+    private readonly headless: boolean,
+    options?: {
+      useAuthSession?: boolean;
+      storageStatePath?: string;
+    }
+  ) {
+    this.useAuthSession = options?.useAuthSession ?? false;
+    this.storageStatePath = options?.storageStatePath;
+  }
 
   async getLatestPost(profileUrl: string): Promise<InstagramPost> {
     const browser = await chromium.launch({ headless: this.headless });
-    const context = await browser.newContext({
+    const contextOptions: BrowserContextOptions = {
       userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       locale: 'es-ES'
-    });
+    };
+
+    if (this.useAuthSession && this.storageStatePath) {
+      if (existsSync(this.storageStatePath)) {
+        contextOptions.storageState = this.storageStatePath;
+      } else {
+        this.logger.warn('IG_USE_AUTH_SESSION is enabled but storage state file was not found', {
+          storageStatePath: this.storageStatePath
+        });
+      }
+    }
+
+    const context = await browser.newContext(contextOptions);
+    if (this.useAuthSession && this.storageStatePath && contextOptions.storageState) {
+      const loadedCookies = await context.cookies('https://www.instagram.com');
+      const hasSessionCookie = loadedCookies.some((cookie) => cookie.name === 'sessionid');
+      this.logger.info('Instagram scraper running with auth session', {
+        storageStatePath: this.storageStatePath,
+        cookiesLoaded: loadedCookies.length,
+        hasSessionCookie
+      });
+    }
 
     const page = await context.newPage();
     page.setDefaultTimeout(this.requestTimeoutMs);
 
     try {
+      // Fast path: with authenticated session, this endpoint is usually the most stable.
+      if (this.useAuthSession) {
+        const apiFirstResult = await this.getLatestPostViaWebProfileInfo(context.request, profileUrl);
+        if (apiFirstResult.post) {
+          this.logger.info('Using web_profile_info as primary extraction path', {
+            profileUrl
+          });
+          return apiFirstResult.post;
+        }
+      }
+
       await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: this.requestTimeoutMs });
       await page.waitForTimeout(1_000);
       await this.dismissObstructions(page);
@@ -90,20 +138,30 @@ export class InstagramScraper {
 
       if (!latestPostUrl) {
         const diagnostics = await this.getProfileDiagnostics(page);
-        const fallbackPost = await this.getLatestPostViaWebProfileInfo(context.request, profileUrl);
-        if (fallbackPost) {
+        const fallbackResult = await this.getLatestPostViaWebProfileInfo(context.request, profileUrl);
+        if (fallbackResult.post) {
           this.logger.warn('Using web_profile_info fallback due profile login/challenge', {
             diagnostics
           });
-          return fallbackPost;
+          return fallbackResult.post;
         }
+
+        const blockedByLogin = diagnostics.hints.some((hint) => ['redirect-login', 'login-wall', 'challenge'].includes(hint));
+        if (blockedByLogin && fallbackResult.statusCode === 401) {
+          throw markAsNonRetryable(
+            new ScraperExtractionError(
+              `Login wall detectado en Instagram con web_profile_info=401. url=${diagnostics.url} title=${diagnostics.title} hints=${diagnostics.hints.join(',') || 'none'}`
+            )
+          );
+        }
+
         throw new ScraperExtractionError(
           `No se pudo encontrar el último post en el perfil. url=${diagnostics.url} title=${diagnostics.title} hints=${diagnostics.hints.join(',') || 'none'}`
         );
       }
 
       await page.goto(latestPostUrl, { waitUntil: 'domcontentloaded', timeout: this.requestTimeoutMs });
-      await page.waitForLoadState('networkidle', { timeout: this.requestTimeoutMs }).catch(() => undefined);
+      await page.waitForTimeout(600);
       await this.dismissObstructions(page);
 
       const raw = await page.evaluate<RawPostExtract>(() => {
@@ -267,10 +325,10 @@ export class InstagramScraper {
   private async getLatestPostViaWebProfileInfo(
     request: APIRequestContext,
     profileUrl: string
-  ): Promise<InstagramPost | null> {
+  ): Promise<WebProfileFallbackResult> {
     const username = extractUsernameFromProfileUrl(profileUrl);
     if (!username) {
-      return null;
+      return { post: null };
     }
 
     const endpoint = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
@@ -293,14 +351,14 @@ export class InstagramScraper {
           status: response.status(),
           username
         });
-        return null;
+        return { post: null, statusCode: response.status() };
       }
 
       const payload = (await response.json()) as WebProfileInfoResponse;
       const firstNode = payload.data?.user?.edge_owner_to_timeline_media?.edges?.[0]?.node;
 
       if (!firstNode?.shortcode) {
-        return null;
+        return { post: null, statusCode: response.status() };
       }
 
       const caption = firstNode.edge_media_to_caption?.edges?.[0]?.node?.text?.trim() ?? '';
@@ -310,7 +368,7 @@ export class InstagramScraper {
       const permalink = buildPermalink(shortcode, mediaType);
 
       if (mediaUrls.length === 0) {
-        return null;
+        return { post: null, statusCode: response.status() };
       }
 
       const result: InstagramPost = {
@@ -328,13 +386,13 @@ export class InstagramScraper {
         }
       }
 
-      return result;
+      return { post: result, statusCode: response.status() };
     } catch (error) {
       this.logger.warn('web_profile_info request failed', {
         username,
         error: getErrorMessage(error)
       });
-      return null;
+      return { post: null };
     }
   }
 
@@ -575,4 +633,10 @@ function getErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function markAsNonRetryable<T extends Error>(error: T): T & { retryable: false } {
+  const enriched = error as T & { retryable: false };
+  enriched.retryable = false;
+  return enriched;
 }

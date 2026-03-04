@@ -57,10 +57,10 @@ cp .env.example .env
 
 Variables obligatorias (ver `.env.example`):
 
-- `IG_PROFILE_URL` (ej. `https://www.instagram.com/somostitanes/`)
-- `THREADS_PROFILE_URL` (opcional, ej. `https://www.threads.net/@somostitanes`)
+- `IG_PROFILE_URL` o `IG_PROFILE_URLS` (CSV)
+- `THREADS_PROFILE_URL` o `THREADS_PROFILE_URLS` (CSV, opcional)
 - `ENABLE_THREADS_FALLBACK` (default `true`)
-- `POLL_MINUTES`
+- `POLL_MINUTES` (debe ser `30`)
 - `DATA_DIR`
 - `R2_ACCOUNT_ID`
 - `R2_ACCESS_KEY_ID`
@@ -83,14 +83,46 @@ Opcionales:
 - `REQUEST_TIMEOUT_MS` (default `30000`)
 - `PLAYWRIGHT_HEADLESS` (default `true`)
 - `LOG_LEVEL` (default `info`)
+- `IG_USE_AUTH_SESSION` (default `false`)
+- `PLAYWRIGHT_STORAGE_STATE_PATH` (default `./data/instagram-storage-state.json`)
+- `PLAYWRIGHT_STORAGE_STATE_B64` (opcional, útil para cloud)
+
+Ejemplo multi-cuenta:
+
+```env
+IG_PROFILE_URLS=https://www.instagram.com/somostitanes/,https://www.instagram.com/memesfan10/
+THREADS_PROFILE_URLS=https://www.threads.net/@somostitanes,https://www.threads.net/@memesfan10
+ENABLE_THREADS_FALLBACK=true
+```
+
+El sistema hace match IG <-> Threads por username (`somostitanes`, `memesfan10`) y respeta el orden en `IG_PROFILE_URLS` para prioridad.
 
 ## Scripts
 
 - `npm run dev`: corre watcher en modo desarrollo.
 - `npm run build`: compila a `dist/`.
 - `npm run start`: corre build de producción.
+- `npm run ig:login`: abre navegador para login manual de Instagram y guarda sesión Playwright.
+- `npm run ig:export-session`: exporta la sesión guardada en formato base64 (texto).
 - `npm run lint`: lint con ESLint.
 - `npm run test`: pruebas unitarias mínimas (`retry`, `state`).
+
+## Sesión IG En Cloud
+
+Para reducir login wall en servidores sin navegador interactivo:
+
+1. En tu máquina local, guarda sesión:
+   ```bash
+   npm run ig:login
+   ```
+2. Exporta sesión como texto:
+   ```bash
+   npm run ig:export-session
+   ```
+3. En tu plataforma cloud, crea secreto/env:
+   - `IG_USE_AUTH_SESSION=true`
+   - `PLAYWRIGHT_STORAGE_STATE_B64=<texto-base64-exportado>`
+4. El servicio reconstruye automáticamente el archivo en `PLAYWRIGHT_STORAGE_STATE_PATH` al iniciar.
 
 ## Estructura
 
@@ -113,25 +145,28 @@ src/
 
 ## Comportamiento del pipeline
 
-Cada ciclo (`node-cron`):
+Cada ciclo (`node-cron`) cada 30 minutos:
 
-1. `getLatestPost(profileUrl)` con Playwright.
-2. Si IG falla y configuraste `THREADS_PROFILE_URL`, intenta Threads como fallback.
-3. Deduplicación por `permalink + sha256(caption)`.
-4. Descarga media principal (reel -> thumbnail).
-5. Sube original a R2:
+1. Revisa perfiles en orden de prioridad (ej. `somostitanes` primero, luego `memesfan10`).
+2. `getLatestPost(profileUrl)` con Playwright para cada target.
+3. Si IG falla y existe Threads asociado para ese username, intenta Threads como fallback.
+4. Deduplicación por `bucket folder key` (`ig/{perfil}/{shortcode}` o `threads/{perfil}/{shortcode}`).
+5. Procesa solo la primera cuenta con post nuevo en el ciclo.
+6. Si ninguna tiene post nuevo, se omite el ciclo.
+7. Descarga media principal (reel -> thumbnail).
+8. Sube original a R2:
    - `ig/somostitanes/{shortcode}/original.jpg`
    - o `threads/somostitanes/{shortcode}/original.jpg` si la fuente fue Threads
-6. Gemini:
+9. Gemini:
    - `generateViralCopy(captionOriginal, permalink)`
    - `generateViralImage(inputImageBuffer, captionOriginal)`
-7. Sube viral a R2:
+10. Sube viral a R2:
    - `ig/somostitanes/{shortcode}/viral.jpg`
    - o `threads/somostitanes/{shortcode}/viral.jpg`
-8. Publica a Facebook Page (2 pasos):
+11. Publica a Facebook Page (2 pasos):
    - `POST /{page-id}/photos` con `url` y `published=false`
    - `POST /{page-id}/feed` con `message` + `attached_media=[{\"media_fbid\":\"<photoId>\"}]`
-9. Persistencia de estado y logs.
+12. Persistencia de estado y logs.
 
 ## Seguridad
 

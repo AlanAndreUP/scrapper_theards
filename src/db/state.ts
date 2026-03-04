@@ -8,8 +8,8 @@ const MAX_PROCESSED_RECORDS = 1000;
 const MAX_RUN_LOGS = 500;
 
 export interface ProcessedRecord {
+  bucketFolderKey: string;
   permalink: string;
-  captionHash: string;
   shortcode: string;
   processedAt: string;
   facebookPostId?: string;
@@ -67,24 +67,29 @@ export class StateStore {
     }
   }
 
-  isProcessed(permalink: string, captionHash: string): boolean {
+  isProcessed(bucketFolderKey: string): boolean {
     this.ensureInitialized();
 
+    const key = makeProcessedKey(bucketFolderKey);
     const last = this.state.lastProcessed;
-    if (last?.permalink === permalink && last.captionHash === captionHash) {
+    if (last?.bucketFolderKey === key) {
       return true;
     }
 
-    const key = makeProcessedKey(permalink, captionHash);
     return Boolean(this.state.processedByKey[key]);
   }
 
   async markProcessed(record: ProcessedRecord): Promise<void> {
     this.ensureInitialized();
 
-    const key = makeProcessedKey(record.permalink, record.captionHash);
-    this.state.lastProcessed = record;
-    this.state.processedByKey[key] = record;
+    const key = makeProcessedKey(record.bucketFolderKey);
+    const normalizedRecord: ProcessedRecord = {
+      ...record,
+      bucketFolderKey: key
+    };
+
+    this.state.lastProcessed = normalizedRecord;
+    this.state.processedByKey[key] = normalizedRecord;
 
     const entries = Object.entries(this.state.processedByKey);
     if (entries.length > MAX_PROCESSED_RECORDS) {
@@ -150,17 +155,59 @@ function createDefaultState(): PersistedState {
 }
 
 function parsePersistedState(raw: string): PersistedState {
-  const parsed = JSON.parse(raw) as Partial<PersistedState>;
+  const parsed = JSON.parse(raw) as {
+    lastProcessed?: Partial<ProcessedRecord>;
+    processedByKey?: Record<string, Partial<ProcessedRecord>>;
+    runLogs?: RunLogRecord[];
+  };
+
+  const normalizedProcessedByKey: Record<string, ProcessedRecord> = {};
+
+  for (const [key, value] of Object.entries(parsed.processedByKey ?? {})) {
+    const bucketFolderKey = typeof value.bucketFolderKey === 'string' ? value.bucketFolderKey : key;
+    if (typeof value.permalink !== 'string' || typeof value.shortcode !== 'string' || typeof value.processedAt !== 'string') {
+      continue;
+    }
+
+    normalizedProcessedByKey[makeProcessedKey(bucketFolderKey)] = {
+      bucketFolderKey: makeProcessedKey(bucketFolderKey),
+      permalink: value.permalink,
+      shortcode: value.shortcode,
+      processedAt: value.processedAt,
+      ...(typeof value.facebookPostId === 'string' ? { facebookPostId: value.facebookPostId } : {})
+    };
+  }
+
+  let normalizedLastProcessed: ProcessedRecord | null = null;
+  const rawLast = parsed.lastProcessed;
+  if (
+    rawLast &&
+    typeof rawLast.permalink === 'string' &&
+    typeof rawLast.shortcode === 'string' &&
+    typeof rawLast.processedAt === 'string'
+  ) {
+    const key = makeProcessedKey(
+      typeof rawLast.bucketFolderKey === 'string' ? rawLast.bucketFolderKey : `legacy/${rawLast.shortcode}`
+    );
+
+    normalizedLastProcessed = {
+      bucketFolderKey: key,
+      permalink: rawLast.permalink,
+      shortcode: rawLast.shortcode,
+      processedAt: rawLast.processedAt,
+      ...(typeof rawLast.facebookPostId === 'string' ? { facebookPostId: rawLast.facebookPostId } : {})
+    };
+  }
 
   return {
-    lastProcessed: parsed.lastProcessed ?? null,
-    processedByKey: parsed.processedByKey ?? {},
+    lastProcessed: normalizedLastProcessed,
+    processedByKey: normalizedProcessedByKey,
     runLogs: parsed.runLogs ?? []
   };
 }
 
-function makeProcessedKey(permalink: string, captionHash: string): string {
-  return `${permalink}::${captionHash}`;
+function makeProcessedKey(bucketFolderKey: string): string {
+  return bucketFolderKey.replace(/^\/+/, '').replace(/\/+$/, '');
 }
 
 function getErrorMessage(error: unknown): string {

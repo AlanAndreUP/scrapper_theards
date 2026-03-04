@@ -37,7 +37,7 @@ export class ThreadsScraper {
 
       const latestPostUrl = await resolveLatestThreadsPostUrl(page);
       if (!latestPostUrl) {
-        throw new ScraperExtractionError('No se encontró post reciente en Threads.');
+        throw markAsNonRetryable(new ScraperExtractionError('No se encontró post reciente en Threads.'));
       }
 
       await page.goto(latestPostUrl, { waitUntil: 'domcontentloaded', timeout: this.requestTimeoutMs });
@@ -166,4 +166,10 @@ function getErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function markAsNonRetryable<T extends Error>(error: T): T & { retryable: false } {
+  const enriched = error as T & { retryable: false };
+  enriched.retryable = false;
+  return enriched;
 }

@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { GeminiClient } from './ai/gemini';
 import { loadEnv } from './config/env';
 import { StateStore } from './db/state';
@@ -21,16 +22,28 @@ async function bootstrap(): Promise<void> {
   });
 
   logger.info('Starting Instagram -> Gemini -> Facebook pipeline', {
-    profileUrl: env.IG_PROFILE_URL,
+    watchTargets: env.WATCH_TARGETS,
     pollMinutes: env.POLL_MINUTES,
-    dataDir: env.DATA_DIR
+    dataDir: env.DATA_DIR,
+    igUseAuthSession: env.IG_USE_AUTH_SESSION,
+    storageStatePath: env.PLAYWRIGHT_STORAGE_STATE_PATH
   });
 
   const stateStore = new StateStore(env.DATA_DIR, logger);
   await stateStore.init();
 
-  const scraper = new InstagramScraper(logger, env.REQUEST_TIMEOUT_MS, env.PLAYWRIGHT_HEADLESS);
-  const threadsScraper = env.THREADS_PROFILE_URL
+  await hydrateInstagramStorageStateFromEnv({
+    useAuthSession: env.IG_USE_AUTH_SESSION,
+    storageStatePath: env.PLAYWRIGHT_STORAGE_STATE_PATH,
+    storageStateBase64: env.PLAYWRIGHT_STORAGE_STATE_B64,
+    logger
+  });
+
+  const scraper = new InstagramScraper(logger, env.REQUEST_TIMEOUT_MS, env.PLAYWRIGHT_HEADLESS, {
+    useAuthSession: env.IG_USE_AUTH_SESSION,
+    storageStatePath: env.PLAYWRIGHT_STORAGE_STATE_PATH
+  });
+  const threadsScraper = env.WATCH_TARGETS.some((target) => Boolean(target.threadsUrl))
     ? new ThreadsScraper(logger, env.REQUEST_TIMEOUT_MS, env.PLAYWRIGHT_HEADLESS)
     : undefined;
 
@@ -66,9 +79,7 @@ async function bootstrap(): Promise<void> {
 
   const poller = new Poller(
     {
-      profileUrl: env.IG_PROFILE_URL,
-      ...(env.THREADS_PROFILE_URL ? { threadsProfileUrl: env.THREADS_PROFILE_URL } : {}),
-      enableThreadsFallback: env.ENABLE_THREADS_FALLBACK,
+      targets: env.WATCH_TARGETS,
       pollMinutes: env.POLL_MINUTES,
       requestTimeoutMs: env.REQUEST_TIMEOUT_MS,
       maxRetries: env.MAX_RETRIES,
@@ -114,3 +125,39 @@ async function bootstrap(): Promise<void> {
 }
 
 void bootstrap();
+
+async function hydrateInstagramStorageStateFromEnv(params: {
+  useAuthSession: boolean;
+  storageStatePath: string;
+  storageStateBase64: string | undefined;
+  logger: Logger;
+}): Promise<void> {
+  if (!params.useAuthSession) {
+    return;
+  }
+
+  if (!params.storageStateBase64) {
+    return;
+  }
+
+  try {
+    const decoded = Buffer.from(params.storageStateBase64, 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded) as { cookies?: unknown[]; origins?: unknown[] };
+    if (!Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) {
+      throw new Error('Decoded storage state must contain cookies[] and origins[].');
+    }
+
+    mkdirSync(dirname(params.storageStatePath), { recursive: true });
+    await writeFile(params.storageStatePath, decoded, 'utf8');
+
+    params.logger.info('Instagram storage state loaded from PLAYWRIGHT_STORAGE_STATE_B64', {
+      storageStatePath: params.storageStatePath
+    });
+  } catch (error) {
+    params.logger.error('Failed to decode PLAYWRIGHT_STORAGE_STATE_B64', {
+      error: error instanceof Error ? error.message : String(error),
+      storageStatePath: params.storageStatePath
+    });
+    throw error;
+  }
+}
