@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+data/*.json
+data/logs/
+playwright-report/
+.DS_Store
+coverage/
